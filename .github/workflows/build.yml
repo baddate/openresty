@@ -2,28 +2,25 @@ name: Build OpenResty with GeoIP2
 
 on:
   push:
-    branches:
-      - master
-    tags:
-      - "v*"
+    branches: [master]
+    tags: ["v*"]
   pull_request:
-    branches:
-      - master
+    branches: [master]
   workflow_dispatch:
     inputs:
-      resty_version:
-        description: "OpenResty version"
-        required: false
+      panel_openresty_version:
+        description: "1panel/openresty base image tag (e.g. 1.27.1.2)"
+        required: true
         default: "1.27.1.2"
       push_image:
         description: "Push image to registry"
         type: boolean
-        required: false
         default: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/openresty-geoip2
+  DEFAULT_PANEL_VERSION: "1.27.1.2-5-1-focal"
 
 jobs:
   build:
@@ -36,14 +33,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 设置 QEMU + buildx（多架构支持） ─────────────────────────────────
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Resolve build args
+        id: args
+        run: |
+          PANEL_VER="${{ inputs.panel_openresty_version || env.DEFAULT_PANEL_VERSION }}"
+          echo "panel_version=${PANEL_VER}" >> $GITHUB_OUTPUT
+          echo "Using 1panel/openresty:${PANEL_VER}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── 登录镜像仓库（仅 push 时） ────────────────────────────────────────
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || inputs.push_image)
         uses: docker/login-action@v3
@@ -52,7 +51,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 生成镜像 tag ───────────────────────────────────────────────────────
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -64,43 +62,41 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            type=raw,value=${{ inputs.resty_version || '1.27.1.2' }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ steps.args.outputs.panel_version }}
 
-      # ── 构建（并可选推送） ────────────────────────────────────────────────
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: ./build
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || inputs.push_image == true) }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            RESTY_VERSION=${{ inputs.resty_version || '1.27.1.2' }}
-            RESTY_J=4
-          # BuildKit 缓存，加速重复构建
+            PANEL_OPENRESTY_VERSION=${{ steps.args.outputs.panel_version }}
+            RESTY_VERSION=1.27.1.2
+            RESTY_J=2
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── 冒烟测试：确认 GeoIP2 模块已加载 ────────────────────────────────
       - name: Smoke test - verify GeoIP2 module
         if: github.event_name != 'pull_request'
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
-          # 本地 build 没推送时用 load 模式，这里直接 run 已推送镜像
-          docker run --rm "$IMAGE" \
-            openresty -V 2>&1 | grep -q "ngx_http_geoip2_module" \
+          IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          docker pull "$IMAGE"
+          docker run --rm "$IMAGE" openresty -V 2>&1 | tee /tmp/openresty-v.txt
+          grep -q "ngx_http_geoip2_module" /tmp/openresty-v.txt \
             && echo "✅ GeoIP2 module confirmed" \
-            || (echo "❌ GeoIP2 module NOT found"; exit 1)
+            || (echo "❌ GeoIP2 module NOT found"; cat /tmp/openresty-v.txt; exit 1)
 
-      # ── 汇总输出 ──────────────────────────────────────────────────────────
       - name: Summary
         if: always()
         run: |
           echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| OpenResty | ${{ inputs.resty_version || '1.27.1.2' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| GeoIP2 module | ✅ enabled |" >> $GITHUB_STEP_SUMMARY
-          echo "| Platforms | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| base | 1panel/openresty:${{ steps.args.outputs.panel_version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OpenResty | 1.27.1.2 |" >> $GITHUB_STEP_SUMMARY
+          echo "| RESTY_J | 2 |" >> $GITHUB_STEP_SUMMARY
+          echo "| GeoIP2 | ✅ enabled via module.json |" >> $GITHUB_STEP_SUMMARY
           echo "| Tags | ${{ steps.meta.outputs.tags }} |" >> $GITHUB_STEP_SUMMARY
