@@ -64,14 +64,16 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
             type=raw,value=${{ steps.args.outputs.panel_version }}
 
-      - name: Build and push
+      # build-push-action 不能同时 load 到本地 daemon 又 push 多平台，
+      # 所以拆成两步：先 load 本地做冒烟测试，再 push 到 registry。
+      - name: Build (load to local daemon for smoke test)
         uses: docker/build-push-action@v6
         with:
           context: ./build
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || inputs.push_image == true) }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          # load=true 把镜像加载进本地 docker daemon，不推送
+          load: true
+          tags: openresty-geoip2:smoke
           build-args: |
             PANEL_OPENRESTY_VERSION=${{ steps.args.outputs.panel_version }}
             RESTY_VERSION=1.27.1.2
@@ -79,15 +81,31 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # 冒烟测试：直接用本地刚 build 好的镜像，不需要 pull，不存在权限问题
       - name: Smoke test - verify GeoIP2 module
-        if: github.event_name != 'pull_request'
         run: |
-          IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
-          docker pull "$IMAGE"
-          docker run --rm "$IMAGE" openresty -V 2>&1 | tee /tmp/openresty-v.txt
+          docker run --rm openresty-geoip2:smoke openresty -V 2>&1 | tee /tmp/openresty-v.txt
           grep -q "ngx_http_geoip2_module" /tmp/openresty-v.txt \
             && echo "✅ GeoIP2 module confirmed" \
             || (echo "❌ GeoIP2 module NOT found"; cat /tmp/openresty-v.txt; exit 1)
+
+      # 冒烟测试通过后才推送到 registry
+      - name: Push to registry
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') || inputs.push_image == true)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./build
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PANEL_OPENRESTY_VERSION=${{ steps.args.outputs.panel_version }}
+            RESTY_VERSION=1.27.1.2
+            RESTY_J=2
+          # 第一次 build 已经写入了 GHA cache，这次直接命中，几乎不重新编译
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Summary
         if: always()
